@@ -120,9 +120,22 @@ void TaskADXLData(void *pvParameters) {
     bool moving = false;
 
     if (ok) {
-      // Remove static gravity (~1g) to get dynamic vibration acceleration.
-      float total_g = sqrtf(ax*ax + ay*ay + az*az);
-      dynamic_g = fabsf(total_g - 1.0f);
+      // Remove static gravity using HIGH-PASS FILTER
+      static float gx = 0, gy = 0, gz = 0;
+      const float alpha = 0.9f;
+
+      // Ước lượng gravity (low-pass filter)
+      gx = alpha * gx + (1 - alpha) * ax;
+      gy = alpha * gy + (1 - alpha) * ay;
+      gz = alpha * gz + (1 - alpha) * az;
+
+      // Loại bỏ gravity component
+      float dx = ax - gx;
+      float dy = ay - gy;
+      float dz = az - gz;
+
+      // Gia tốc động thực sự (high-pass filtered)
+      dynamic_g = sqrtf(dx*dx + dy*dy + dz*dz);
       shock = (dynamic_g >= SHOCK_G_THRESHOLD);
       moving = (dynamic_g >= MOTION_G_THRESHOLD);
     }
@@ -134,7 +147,7 @@ void TaskADXLData(void *pvParameters) {
       xSemaphoreGive(sensorDataMutex);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 

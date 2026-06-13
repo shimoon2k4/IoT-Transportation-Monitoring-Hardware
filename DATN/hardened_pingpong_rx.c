@@ -57,11 +57,11 @@ typedef enum { LOWPOWER, RX, RX_TIMEOUT, RX_ERROR, TX, TX_TIMEOUT } States_t;
 #define BUFFER_SIZE             280
 #define CHUNK_MAX               270
 
-#define MAX_JUMP_THRESHOLD          5000
+#define MAX_JUMP_THRESHOLD          20000  // Cho phép gap lớn hơn trong mạng yếu
 #define ANTI_REPLAY_WINDOW_SEC      300
 #define CLOCK_SKEW_TOLERANCE_SEC    5
 #define MAX_NODES                   10
-#define WINDOW_SIZE 32
+#define WINDOW_SIZE 32  // Khớp với 32-bit bitmap (uint32_t)
 
 #define SECRET_KEY_LEN 16
 static const uint8_t SECRET_KEY[SECRET_KEY_LEN] = {
@@ -99,6 +99,14 @@ static uint32_t valid_packets = 0;
 static uint32_t invalid_seq = 0;
 static uint32_t invalid_crc = 0;
 static uint32_t invalid_jump = 0;
+
+// === DEMO 3: Timing Tracking ===
+static uint32_t demo_start_time = 0;
+static uint32_t last_rx_time[MAX_NODES];
+#define TIMED_LOG(fmt, ...) do { \
+    uint32_t elapsed = TimerGetCurrentTime() - demo_start_time; \
+    printf("[%7lu ms] " fmt "\r\n", (unsigned long)elapsed, ##__VA_ARGS__); \
+} while(0)
 
 typedef struct {
     uint8_t  node_id;
@@ -292,6 +300,8 @@ int app_start(void)
     printf("\r\n");
 
     per_node_init();
+    memset(last_rx_time, 0, sizeof(last_rx_time));
+    demo_start_time = TimerGetCurrentTime();
 
     RadioEvents.TxDone = OnTxDone;
     RadioEvents.RxDone = OnRxDone;
@@ -344,10 +354,16 @@ int app_start(void)
 
                 if (pkt.valid) {
                     total_accepted++;
-                    printf("[RX OK] node=%u, seq=%lu, len=%u, rssi=%d, snr=%d\r\n",
+                    uint32_t now_ms = TimerGetCurrentTime();
+                    uint32_t delta_ms = (last_rx_time[pkt.node_id] > 0) ? 
+                        (now_ms - last_rx_time[pkt.node_id]) : 0;
+                    last_rx_time[pkt.node_id] = now_ms;
+                    
+                    TIMED_LOG("[RX OK] node=%u, seq=%lu, len=%u, delta=%lu ms, rssi=%d dBm, snr=%d dB",
                            (unsigned)pkt.node_id,
                            (unsigned long)pkt.seq,
                            (unsigned)pkt.payload_len,
+                           (unsigned long)delta_ms,
                            (int)RssiValue,
                            (int)SnrValue);
 
@@ -355,17 +371,16 @@ int app_start(void)
                         char payload_str[CHUNK_MAX + 1];
                         memcpy(payload_str, (char*)pkt.payload, pkt.payload_len);
                         payload_str[pkt.payload_len] = '\0';
-                        printf("Payload: %s\r\n", payload_str);
+                        printf("        Payload: %s\r\n", payload_str);
                     }
                 } else {
                     total_rejected++;
-                    printf("[RX DROP] node=%u, seq=%lu, rssi=%d\r\n",
+                    TIMED_LOG("[RX DROP] node=%u, seq=%lu, rssi=%d (Reason: %s)",
                            (unsigned)pkt.node_id,
                            (unsigned long)pkt.seq,
-                           (int)RssiValue);
-                    printf("        Reason: %s\r\n", pkt.reject_reason);
+                           (int)RssiValue,
+                           pkt.reject_reason);
                 }
-                printf("\r\n");
             }
             Radio.Rx(RX_TIMEOUT_VALUE);
             State = LOWPOWER;
@@ -394,21 +409,26 @@ int app_start(void)
             static uint32_t last_stats = 0;
             uint32_t now = TimerGetCurrentTime();
             if (TimerGetElapsedTime(last_stats) > 30000) {
-                printf("\r\n=== GATEWAY STATISTICS (30sec) ===\r\n");
-                printf("Total accepted: %lu\r\n", (unsigned long)total_accepted);
-                printf("Total rejected: %lu\r\n", (unsigned long)total_rejected);
-                printf("Active nodes:   %u/%u\r\n", node_count, MAX_NODES);
+                printf("\r\n");
+                TIMED_LOG("=== GATEWAY STATISTICS (30sec) ===");
+                TIMED_LOG("Total accepted: %lu | Total rejected: %lu", 
+                    (unsigned long)total_accepted, (unsigned long)total_rejected);
+                TIMED_LOG("Active nodes:   %u/%u", node_count, MAX_NODES);
                 printf("\r\n");
 
-                printf("Per-Node Status:\r\n");
+                TIMED_LOG("Per-Node Status:");
                 for (uint8_t i = 0; i < node_count; i++) {
-                    printf("  Node %u: seq=%lu, ok=%lu, bad=%lu\r\n",
+                    uint32_t total = node_states[i].packets_received + node_states[i].packets_rejected;
+                    uint32_t rate = (total > 0) ? (100U * node_states[i].packets_received / total) : 0;
+                    TIMED_LOG("  Node %u: seq=%lu, ok=%lu, bad=%lu, rate=%lu%%, rssi=%d dBm",
                            (unsigned)node_states[i].node_id,
                            (unsigned long)node_states[i].last_seq,
                            (unsigned long)node_states[i].packets_received,
-                           (unsigned long)node_states[i].packets_rejected);
+                           (unsigned long)node_states[i].packets_rejected,
+                           (unsigned long)rate,
+                           (int)node_states[i].last_rssi);
                 }
-                printf("==================================\r\n\r\n");
+                TIMED_LOG("==================================\r\n");
 
                 last_stats = now;
             }
