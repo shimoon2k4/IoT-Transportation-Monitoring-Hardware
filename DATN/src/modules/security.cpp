@@ -65,3 +65,48 @@ String hmacSha256(const String &message) {
 
     return String(hex_output);
 }
+
+void encryptBlockInPlace(uint8_t* block) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, aes_key, 128);
+    uint8_t temp[16];
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, block, temp);
+    memcpy(block, temp, 16);
+    mbedtls_aes_free(&aes);
+}
+
+void decryptBlockInPlace(uint8_t* block) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, aes_key, 128);
+    uint8_t temp[16];
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, block, temp);
+    memcpy(block, temp, 16);
+    mbedtls_aes_free(&aes);
+}
+
+uint16_t calculateCRC16(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= ((uint16_t)data[i] << 8);
+        for (int j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+            crc &= 0xFFFF;
+        }
+    }
+    return crc;
+}
+
+uint16_t computeFrameAuthTag(const uint8_t* header, size_t header_len, const uint8_t* payload, size_t payload_len) {
+    const char* key = HMAC_SECRET;
+    size_t key_len = strlen(key);
+    size_t total_len = key_len + header_len + payload_len;
+    uint8_t* buf = new uint8_t[total_len];
+    memcpy(buf, key, key_len);
+    memcpy(buf + key_len, header, header_len);
+    memcpy(buf + key_len + header_len, payload, payload_len);
+    uint16_t auth_tag = calculateCRC16(buf, total_len);
+    delete[] buf;
+    return auth_tag;
+}
