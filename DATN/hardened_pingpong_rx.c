@@ -5,8 +5,10 @@
 #include "timer.h"
 #include "radio.h"
 #include "tremo_system.h"
+#include "tremo_uart.h"
 
 #if defined( REGION_AS923 )
+// ... keep freq defs ...
 #define RF_FREQUENCY                                923000000
 #elif defined( REGION_AU915 )
 #define RF_FREQUENCY                                915000000
@@ -54,8 +56,8 @@
 typedef enum { LOWPOWER, RX, RX_TIMEOUT, RX_ERROR, TX, TX_TIMEOUT } States_t;
 
 #define RX_TIMEOUT_VALUE        3000
-#define BUFFER_SIZE             280
-#define CHUNK_MAX               270
+#define BUFFER_SIZE             255
+#define CHUNK_MAX               230
 
 #define MAX_JUMP_THRESHOLD          20000  // Cho phép gap lớn hơn trong mạng yếu
 #define ANTI_REPLAY_WINDOW_SEC      300
@@ -63,11 +65,16 @@ typedef enum { LOWPOWER, RX, RX_TIMEOUT, RX_ERROR, TX, TX_TIMEOUT } States_t;
 #define MAX_NODES                   10
 #define WINDOW_SIZE 32  // Khớp với 32-bit bitmap (uint32_t)
 
+#define UART_INST UART0
+#define UART_BAUD 115200
+
 #define SECRET_KEY_LEN 16
 static const uint8_t SECRET_KEY[SECRET_KEY_LEN] = {
     0x13,0x37,0xAA,0x55,0x99,0x42,0xDE,0xAD,
     0xBE,0xEF,0x77,0x21,0x66,0x88,0xCC,0x10
 };
+
+static uint16_t crc16_calc(const uint8_t* data, uint16_t len);
 
 static uint16_t compute_auth_tag(uint8_t node_id, uint32_t seq, const uint8_t* payload, uint16_t len) {
     uint8_t auth_buf[BUFFER_SIZE];
@@ -89,11 +96,18 @@ static uint8_t  LoraBuf[BUFFER_SIZE];
 static uint16_t LoraLen = 0;
 
 volatile States_t State = LOWPOWER;
+static volatile uint8_t  txDone = 0;
 int8_t RssiValue = 0;
 int8_t SnrValue = 0;
 uint32_t ChipId[2] = {0};
 
+static uint8_t LOCAL_NODE_ID = 0; // Gateway is node 0
+static uint32_t tx_sequence = 0;
+
 static RadioEvents_t RadioEvents;
+
+static char uart_json_buffer[300];
+static uint16_t uart_json_idx = 0;
 
 static uint32_t valid_packets = 0;
 static uint32_t invalid_seq = 0;
@@ -135,6 +149,99 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr);
 void OnTxTimeout(void);
 void OnRxTimeout(void);
 void OnRxError(void);
+
+static void uart_init_wrapper(uint32_t baud)
+{
+    uart_config_t cfg;
+    uart_config_init(&cfg);
+
+    cfg.baudrate     = baud;
+    cfg.data_width   = UART_DATA_WIDTH_8;
+    cfg.stop_bits    = UART_STOP_BITS_1;
+    cfg.parity       = UART_PARITY_NO;
+    cfg.flow_control = UART_FLOW_CONTROL_DISABLED;
+    cfg.mode         = UART_MODE_TXRX;
+    cfg.fifo_mode    = 1;
+
+    uart_init(UART_INST, &cfg);
+    uart_cmd(UART_INST, true);
+}
+
+static int uart_available_wrapper(void)
+{
+    return uart_get_flag_status(UART_INST, UART_FLAG_RX_FIFO_EMPTY) ? 0 : 1;
+}
+
+static int uart_readbyte_wrapper(void)
+{
+    if (!uart_available_wrapper()) return -1;
+    return (int)uart_receive_data(UART_INST);
+}
+
+static const char* uart_read_json_line(uint32_t timeout_ms)
+{
+    uint32_t start = TimerGetCurrentTime();
+
+    while (TimerGetElapsedTime(start) < timeout_ms) {
+        int byte = uart_readbyte_wrapper();
+
+        if (byte >= 0) {
+            if (byte == '\n') {
+                uart_json_buffer[uart_json_idx] = 0;
+
+                if (uart_json_idx > 0) {
+                    // Gateway UART RX is receiving ACK from ESP32
+                    uart_json_idx = 0;
+                    return uart_json_buffer;
+                }
+                uart_json_idx = 0;
+            } else if (byte == '\r') {
+            } else if (uart_json_idx < (sizeof(uart_json_buffer) - 1)) {
+                uart_json_buffer[uart_json_idx++] = (char)byte;
+            } else {
+                uart_json_idx = 0;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static void radio_send_blocking(const uint8_t* data, uint16_t len)
+{
+    txDone = 0;
+    Radio.Send((uint8_t*)data, len);
+    while (!txDone) { Radio.IrqProcess(); }
+}
+
+static void send_enhanced_secure_packet(const uint8_t* plaintext, uint16_t plain_len) {
+    if (plain_len > CHUNK_MAX) return;
+
+    uint8_t packet[BUFFER_SIZE];
+    int pkt_pos = 0;
+    uint32_t current_seq = tx_sequence;
+
+    packet[pkt_pos++] = LOCAL_NODE_ID;
+    packet[pkt_pos++] = (current_seq >>  0) & 0xFF;
+    packet[pkt_pos++] = (current_seq >>  8) & 0xFF;
+    packet[pkt_pos++] = (current_seq >> 16) & 0xFF;
+    packet[pkt_pos++] = (current_seq >> 24) & 0xFF;
+    
+    tx_sequence++;
+
+    packet[pkt_pos++] = (plain_len >> 0) & 0xFF;
+    packet[pkt_pos++] = (plain_len >> 8) & 0xFF;
+
+    memcpy(&packet[pkt_pos], plaintext, plain_len);
+    pkt_pos += plain_len;
+
+    uint16_t auth = compute_auth_tag(LOCAL_NODE_ID, current_seq, plaintext, plain_len);
+    packet[pkt_pos++] = (auth >> 0) & 0xFF;
+    packet[pkt_pos++] = (auth >> 8) & 0xFF;
+
+    radio_send_blocking(packet, (uint16_t)pkt_pos);
+    printf("[TX SECURE] Gateway sent ACK, seq=%lu, AUTH=0x%04X\r\n", (unsigned long)current_seq, auth);
+}
 
 static uint16_t crc16_calc(const uint8_t* data, uint16_t len)
 {
@@ -180,8 +287,8 @@ static int check_and_update_seq(PerNodeState_t* t, uint32_t seq)
     if (seq > t->last_seq) {
         uint32_t shift = seq - t->last_seq;
 
-        if (shift > WINDOW_SIZE) {
-            printf("[DROP] Jump too large: %lu\r\n", (unsigned long)shift);
+        if (shift > MAX_JUMP_THRESHOLD) {
+            printf("[DROP] Jump too large: %lu > %lu\r\n", (unsigned long)shift, (unsigned long)MAX_JUMP_THRESHOLD);
             return 0;
         }
 
@@ -336,6 +443,7 @@ int app_start(void)
 
     Radio.Rx(RX_TIMEOUT_VALUE);
 
+    uart_init_wrapper(UART_BAUD);
     printf("Listening for Follower Nodes...\r\n");
     printf("Max nodes: %u | Max payload: %u bytes\r\n", MAX_NODES, CHUNK_MAX);
     printf("==============================================\r\n\r\n");
@@ -405,6 +513,14 @@ int app_start(void)
 
         Radio.IrqProcess();
 
+        const char* json_line = uart_read_json_line(10);
+        if (json_line != NULL && strlen(json_line) > 0) {
+            if (strlen(json_line) <= CHUNK_MAX) {
+                send_enhanced_secure_packet((uint8_t*)json_line, strlen(json_line));
+                Radio.Rx(RX_TIMEOUT_VALUE); // Back to listening
+            }
+        }
+
         {
             static uint32_t last_stats = 0;
             uint32_t now = TimerGetCurrentTime();
@@ -439,6 +555,7 @@ int app_start(void)
 void OnTxDone(void)
 {
     Radio.Sleep();
+    txDone = 1;
     State = TX;
 }
 
@@ -458,6 +575,7 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr)
 void OnTxTimeout(void)
 {
     Radio.Sleep();
+    txDone = 1;
     State = TX_TIMEOUT;
 }
 

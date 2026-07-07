@@ -16,4 +16,7 @@ extern bool sd_append_line(const char* filename, const char* data);
 // Khai báo hàm flush (để ghi dữ liệu vào thẻ SD trước khi tắt hoặc reset)
 extern void sd_flush();
 
+// EEPROM Boot Counter
+extern uint32_t increment_and_get_boot_counter();
+
 #endif // LOCAL_MEMORY_H

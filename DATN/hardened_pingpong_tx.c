@@ -55,8 +55,8 @@
 typedef enum { LOWPOWER, RX, RX_TIMEOUT, RX_ERROR, TX, TX_TIMEOUT } States_t;
 
 #define RX_TIMEOUT_VALUE    3000
-#define BUFFER_SIZE         280
-#define CHUNK_MAX           270
+#define BUFFER_SIZE         255
+#define CHUNK_MAX           230
 #define MAX_JUMP_THRESHOLD  5000
 #define MAX_NODES           10
 
@@ -99,6 +99,8 @@ static const uint8_t SECRET_KEY[SECRET_KEY_LEN] = {
     0xBE,0xEF,0x77,0x21,0x66,0x88,0xCC,0x10
 };
 
+static uint16_t crc16_calc(const uint8_t* data, uint16_t len);
+
 static uint16_t compute_auth_tag(uint8_t node_id, uint32_t seq, const uint8_t* payload, uint16_t len) {
     uint8_t auth_buf[BUFFER_SIZE];
     int p = 0;
@@ -132,6 +134,80 @@ static void seq_init(void)
 {
     memset(seq_trackers, 0, sizeof(seq_trackers));
     seq_tracker_count = 0;
+}
+
+static int check_and_update_seq(SeqTracker_t* t, uint32_t seq)
+{
+    if (seq > t->last_seq) {
+        if (seq - t->last_seq > MAX_JUMP_THRESHOLD) {
+            printf("[DROP] Jump too large\r\n");
+            return 0;
+        }
+        t->last_seq = seq;
+        return 1;
+    }
+    printf("[DROP] Replay or old packet\r\n");
+    return 0;
+}
+
+static void parse_and_validate_packet(const uint8_t* raw, uint16_t raw_len, OptimizedSecurePacket_t* pkt, int* valid)
+{
+    memset(pkt, 0, sizeof(*pkt));
+    *valid = 0;
+
+    if (raw_len < 9) {
+        return;
+    }
+
+    int pos = 0;
+    pkt->node_id = raw[pos++];
+
+    pkt->seq = (uint32_t)raw[pos+0]
+             | ((uint32_t)raw[pos+1] << 8)
+             | ((uint32_t)raw[pos+2] << 16)
+             | ((uint32_t)raw[pos+3] << 24);
+    pos += 4;
+
+    pkt->payload_len = (uint16_t)raw[pos+0] | ((uint16_t)raw[pos+1] << 8);
+    pos += 2;
+
+    if (pkt->payload_len > CHUNK_MAX || pos + pkt->payload_len + 2 > raw_len) {
+        return;
+    }
+
+    memcpy(pkt->payload, &raw[pos], pkt->payload_len);
+    pos += pkt->payload_len;
+    pkt->crc = (uint16_t)raw[pos+0] | ((uint16_t)raw[pos+1] << 8);
+
+    uint16_t expected = compute_auth_tag(pkt->node_id, pkt->seq, pkt->payload, pkt->payload_len);
+    if (expected != pkt->crc) {
+        return;
+    }
+
+    // Since this is the TX node receiving ACKs from Gateway (node 0 usually, or just any ACK)
+    // We update seq tracker
+    SeqTracker_t* node = NULL;
+    for (uint8_t i = 0; i < seq_tracker_count; i++) {
+        if (seq_trackers[i].node_id == pkt->node_id) {
+            node = &seq_trackers[i];
+            break;
+        }
+    }
+    if (!node) {
+        if (seq_tracker_count < MAX_NODES) {
+            node = &seq_trackers[seq_tracker_count++];
+            node->node_id = pkt->node_id;
+            node->last_seq = pkt->seq;
+            *valid = 1;
+            return;
+        } else {
+            return; // max nodes
+        }
+    }
+
+    if (check_and_update_seq(node, pkt->seq)) {
+        *valid = 1;
+    }
 }
 
 static int seq_is_valid_with_jump_check(uint32_t node_id, uint32_t seq)
@@ -351,6 +427,47 @@ int app_start(void)
     Radio.Rx(RX_TIMEOUT_VALUE);
 
     while (1) {
+        switch (State)
+        {
+        case RX:
+            {
+                OptimizedSecurePacket_t pkt;
+                int valid = 0;
+                parse_and_validate_packet(LoraBuf, LoraLen, &pkt, &valid);
+
+                if (valid) {
+                    if (pkt.payload_len > 0) {
+                        char payload_str[CHUNK_MAX + 1];
+                        memcpy(payload_str, (char*)pkt.payload, pkt.payload_len);
+                        payload_str[pkt.payload_len] = '\0';
+                        // IN RA UART ĐỂ ESP32 ĐỌC ĐƯỢC
+                        printf("%s\r\n", payload_str);
+                    }
+                } else {
+                    // printf("[RX DROP] Invalid packet received\r\n");
+                }
+            }
+            Radio.Rx(RX_TIMEOUT_VALUE);
+            State = LOWPOWER;
+            break;
+        case TX:
+            Radio.Rx(RX_TIMEOUT_VALUE);
+            State = LOWPOWER;
+            break;
+        case RX_TIMEOUT:
+        case RX_ERROR:
+            Radio.Rx(RX_TIMEOUT_VALUE);
+            State = LOWPOWER;
+            break;
+        case TX_TIMEOUT:
+            Radio.Rx(RX_TIMEOUT_VALUE);
+            State = LOWPOWER;
+            break;
+        case LOWPOWER:
+        default:
+            break;
+        }
+
         Radio.IrqProcess();
 
         const char* json_line = uart_read_json_line(100);
@@ -363,14 +480,6 @@ int app_start(void)
                 printf("[TX OK] Real sensor data transmitted\r\n");
             } else {
                 printf("[TX ERROR] JSON too long (%u > %u)\r\n", (unsigned)strlen(json_line), CHUNK_MAX);
-            }
-        } else {
-            static uint32_t last_status_msg = 0;
-            uint32_t now = TimerGetCurrentTime();
-
-            if (TimerGetElapsedTime(last_status_msg) > 5000) {
-                printf("[STATUS] Waiting for real sensor data from ESP32 via UART\r\n");
-                last_status_msg = now;
             }
         }
     }

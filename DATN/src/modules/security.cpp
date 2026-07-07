@@ -5,15 +5,15 @@
 
 // ===== AES-128 CBC ENCRYPTION CONFIG =====
 static const uint8_t aes_key[16] = {
-    0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
-    0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x10
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
 static const uint8_t aes_iv[16] = {
-    0xA1,0xB2,0xC3,0xD4,0xE5,0xF6,0x07,0x18,
-    0x29,0x3A,0x4B,0x5C,0x6D,0x7E,0x8F,0x90
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
 };
 
-#define HMAC_SECRET "datn_252_secret_key"
+#define HMAC_SECRET "datn_253_secure_hmac_key_2026"
 
 String encryptDataToAESBase64(const String& jsonStr) {
     mbedtls_aes_context aes;
@@ -64,4 +64,49 @@ String hmacSha256(const String &message) {
     hex_output[64] = '\0';
 
     return String(hex_output);
+}
+
+void encryptBlockInPlace(uint8_t* block) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, aes_key, 128);
+    uint8_t temp[16];
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, block, temp);
+    memcpy(block, temp, 16);
+    mbedtls_aes_free(&aes);
+}
+
+void decryptBlockInPlace(uint8_t* block) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, aes_key, 128);
+    uint8_t temp[16];
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, block, temp);
+    memcpy(block, temp, 16);
+    mbedtls_aes_free(&aes);
+}
+
+uint16_t calculateCRC16(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= ((uint16_t)data[i] << 8);
+        for (int j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+            crc &= 0xFFFF;
+        }
+    }
+    return crc;
+}
+
+uint16_t computeFrameAuthTag(const uint8_t* header, size_t header_len, const uint8_t* payload, size_t payload_len) {
+    const char* key = HMAC_SECRET;
+    size_t key_len = strlen(key);
+    size_t total_len = key_len + header_len + payload_len;
+    uint8_t* buf = new uint8_t[total_len];
+    memcpy(buf, key, key_len);
+    memcpy(buf + key_len, header, header_len);
+    memcpy(buf + key_len + header_len, payload, payload_len);
+    uint16_t auth_tag = calculateCRC16(buf, total_len);
+    delete[] buf;
+    return auth_tag;
 }

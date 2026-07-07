@@ -118,3 +118,23 @@ bool sd_append_line(const char* filename, const char* data) {
 void sd_flush() {
   if (s_logFile) s_logFile.flush();
 }
+
+#include <EEPROM.h>
+#define EEPROM_SIZE 512
+#define BOOT_COUNTER_ADDR 0
+
+uint32_t increment_and_get_boot_counter() {
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    Serial.println("[EEPROM] Failed to initialize EEPROM");
+    return 1;
+  }
+  uint32_t counter = 0;
+  EEPROM.get(BOOT_COUNTER_ADDR, counter);
+  if (counter == 0xFFFFFFFF) {
+    counter = 0;
+  }
+  counter++;
+  EEPROM.put(BOOT_COUNTER_ADDR, counter);
+  EEPROM.commit();
+  return counter;
+}

@@ -8,15 +8,27 @@
 #include "gps.h"
 #include "dht11.h"
 #include "adxl345.h"
-#include "ldr.h"
+#include "tamper.h"
+#include "battery.h"
 #include "vehicle_config.h"
 #include "sensor_Data.h"
 
+#include "frame_codec.h"
+#include "local_memory.h"
+#include <esp_task_wdt.h>
+
+// WDT timeout in seconds
+#define WDT_TIMEOUT 10
+
+uint16_t global_session_id = 0;
+
 // ===== Pins / Config =====
-#define DHTPIN    14
-#define DHTTYPE   DHT11
-#define LED_PIN   2
-#define LDR_PIN   35     
+#define DHTPIN      14
+#define DHTTYPE     DHT11
+#define LED_PIN     2
+#define TAMPER_PIN  27
+#define BUZZER_PIN  13
+#define BAT_ADC_PIN 34     
 
 #ifndef VEHICLE_DEVICE_ID
   #define VEHICLE_DEVICE_ID "VX"
@@ -26,7 +38,8 @@
 GPSNeo6M  gps(16, 17, 9600);
 DHTModule dht(DHTPIN, DHTTYPE);
 ADXLModule adxl; // ADXL345
-LDRModule ldr(LDR_PIN); 
+TamperModule tamper(TAMPER_PIN, BUZZER_PIN, LED_PIN);
+BatteryModule battery(BAT_ADC_PIN); 
 
 // --- LoRa UART (RA-08H TX connected here) on UART1 ---
 #define LORA_RX   25     // ESP32 RX1  <= TX of RA-08H
@@ -102,7 +115,9 @@ void TaskGPS(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xPeriod = pdMS_TO_TICKS(100);
 
+  esp_task_wdt_add(NULL);
   for (;;) {
+    esp_task_wdt_reset();
     gps.read();
 
     if (gps.updated()) {
@@ -123,14 +138,23 @@ void TaskTamperMonitor(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xPeriod = pdMS_TO_TICKS(100);
 
+  esp_task_wdt_add(NULL);
   for (;;) {
-    bool tamper = ldr.isTamper();
+    esp_task_wdt_reset();
+    // SW2 reads HIGH if box is opened (switch released)
+    bool open_state = tamper.isTriggered();
 
-    if (tamper && !g_tamper_alert) {
-      g_tamper_alert = true;
-      uint16_t light_level = ldr.getLightLevel();
-
-      Serial.println("[TAMPER ALERT] BOX OPENED!");
+    if (open_state) {
+      if (!g_tamper_alert) {
+        g_tamper_alert = true;
+        Serial.println("[TAMPER ALERT] BOX OPENED!");
+      }
+      tamper.checkTamper(); // Set tamper_detected = true
+      tamper.updateAlarm(true);
+    } else {
+      g_tamper_alert = false;
+      tamper.resetTamper(); // Clear tamper state when closed
+      tamper.updateAlarm(false);
     }
 
     vTaskDelayUntil(&xLastWakeTime, xPeriod);
@@ -151,8 +175,11 @@ void TaskLoraSend(void *pv) {
   }
 
   const TickType_t xInterval = pdMS_TO_TICKS(g_send_interval_ms);
+  static uint16_t packet_seq = 0;
 
+  esp_task_wdt_add(NULL);
   for (;;) {
+    esp_task_wdt_reset();
     SensorData localData = {}; 
 
     if (xSemaphoreTake(sensorDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -180,42 +207,106 @@ void TaskLoraSend(void *pv) {
         accel_g = -999.0f;
     }
 
-    // read tamper/light status
-    uint16_t light_level = ldr.readSmoothed();
-    bool is_tamper = ldr.getTamperState();
+    // Read battery voltage in millivolts (e.g. 3850 mV)
+    uint16_t battery_mv = battery.readVoltagemV();
+    // Check tamper state from SW2
+    bool is_tamper = tamper.getTamperState();
 
     uint32_t ts = millis();
-    char payload[320];
-    int n = snprintf(payload, sizeof(payload),
-      "{\"v\":\"%s\",\"ts\":%lu,\"t\":%.1f,\"h\":%.1f,\"a\":%.2f,\"l\":%u,\"x\":%d,\"la\":%.5f,\"lo\":%.5f}",
-      gVehicleConfig.getDeviceId(),
-      (unsigned long)ts,
-      isnan(temp) ? -999.0F : temp,
-      isnan(hum) ? -999.0F : hum,
-      (accel_g < -900.0f) ? -999.0F : accel_g,
-      light_level,
-      is_tamper ? 1 : 0,
-      lat,
-      lng
-    );
 
-    if (n > 0) {
-      String jsonPayload(payload);
-      String signature = hmacSha256(jsonPayload);
-      String signedJson = jsonPayload;
-      if (signedJson.endsWith("}")) {
-        signedJson = signedJson.substring(0, signedJson.length() - 1);
-      }
-      signedJson += ",\"sig\":\"" + signature + "\"}";
+    // Fill the binary frame
+    LoRaFrame frame;
+    memset(&frame, 0, sizeof(frame));
 
-      String securePayload = encryptDataToAESBase64(signedJson);
-      LORA_SER.println(securePayload); 
+    frame.header.magic[0] = 0x25;
+    frame.header.magic[1] = 0x03;
+    frame.header.device_id = gVehicleConfig.getVehicleNumber();
+    frame.header.vehicle_id = gVehicleConfig.getVehicleNumber();
+    frame.header.session_id = global_session_id;
+    frame.header.packet_id = ++packet_seq;
+    frame.header.timestamp = ts;
+    frame.header.type = 1; // Telemetry
+    
+    // Set Flags bitmask
+    frame.header.flags = 0;
+    if (is_tamper) {
+      frame.header.flags |= (1 << 0);
+    }
+    if (lat != 0.0 && lng != 0.0) {
+      frame.header.flags |= (1 << 1); // GPS fix flag
+    }
+    if (accel_g > 1.2f || accel_g < -1.2f) { // simple vibration threshold
+      frame.header.flags |= (1 << 2);
+    }
+    if (battery_mv < 3400) { // Low battery threshold (3.4V)
+      frame.header.flags |= (1 << 3);
+    }
+
+    // Fill Payload
+    frame.payload.temperature = (int16_t)round(temp * 10.0f);
+    frame.payload.humidity = (int16_t)round(hum * 10.0f);
+    frame.payload.accel_mag = (int16_t)round(accel_g * 100.0f);
+    frame.payload.light_level = battery_mv; // Send battery voltage instead of light level
+    frame.payload.latitude = (int32_t)round(lat * 1e6);
+    frame.payload.longitude = (int32_t)round(lng * 1e6);
+
+    // Encrypt payload in-place (AES-128 16 bytes)
+    encryptBlockInPlace((uint8_t*)&frame.payload);
+
+    // Compute Auth Tag (2 bytes) over Header + encrypted Payload
+    frame.footer.auth_tag = computeFrameAuthTag((const uint8_t*)&frame.header, sizeof(frame.header), (const uint8_t*)&frame.payload, sizeof(frame.payload));
+
+    // Compute CRC (2 bytes) over Header + Payload + Auth Tag (which is 30 bytes)
+    frame.footer.crc = calculateCRC16((const uint8_t*)&frame, sizeof(frame) - sizeof(frame.footer.crc));
+
+    // Convert the 32-byte frame to a 64-character Hex string
+    char hex_payload[100];
+    encode_frame_to_hex(frame, hex_payload);
+
+    bool ack_received = false;
+    int retry_count = 0;
+    while (!ack_received && retry_count < 3) {
+      // Send the hex-encoded frame via UART to RA-08H
+      LORA_SER.println(hex_payload); 
       LORA_SER.flush();
-      Serial.print("[ESP32->LORA] AES-128 CBC + BASE64 payload sent (len: ");
-      Serial.print(securePayload.length());
-      Serial.println(")");
-    } else {
-      Serial.printf("[ERROR] snprintf failed! n=%d\r\n", n);
+
+      Serial.printf("[ESP32->LORA] Frame sent (Seq=%u, Retry=%d). Waiting for ACK...\r\n", packet_seq, retry_count);
+
+      uint32_t t0 = millis();
+      String rx_buf = "";
+      while (millis() - t0 < 2000) {
+        esp_task_wdt_reset();
+        while (LORA_SER.available()) {
+          char c = (char)LORA_SER.read();
+          rx_buf += c;
+          Serial.print(c); // DEBUG: Print RA-08H output directly to Serial
+        }
+        
+        int start_idx = rx_buf.indexOf("2503");
+        if (start_idx >= 0 && rx_buf.length() >= start_idx + 68) {
+           String frame_hex = rx_buf.substring(start_idx, start_idx + 68);
+           LoRaFrame ack_frame;
+           if (hex_string_to_bytes(frame_hex, (uint8_t*)&ack_frame, sizeof(ack_frame))) {
+               if (ack_frame.header.type == 0xFF && ack_frame.header.packet_id == packet_seq) {
+                   ack_received = true;
+                   Serial.println("[LORA] ACK Received successfully!");
+                   break;
+               }
+           }
+           rx_buf = rx_buf.substring(start_idx + 68);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+      }
+
+      if (!ack_received) {
+        retry_count++;
+        Serial.printf("[LORA] ACK timeout, retrying %d/3...\n", retry_count);
+        vTaskDelay(pdMS_TO_TICKS(500 + random(0, 1000))); // Random backoff
+      }
+    }
+
+    if (!ack_received) {
+      Serial.println("[ERROR] Failed to send LoRa frame after 3 retries.");
     }
 
     vTaskDelayUntil(&xLastWakeTime, xInterval);
@@ -226,7 +317,22 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = WDT_TIMEOUT * 1000,
+      .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,    // Bitmask of all cores
+      .trigger_panic = true,
+  };
+  esp_task_wdt_init(&wdt_config);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT, true); // Initialize Watchdog with WDT_TIMEOUT seconds timeout, panic = true
+#endif
+  esp_task_wdt_add(NULL); // Add setup/loop task to WDT
+  
   EEPROM.begin(512); 
+  global_session_id = (uint16_t)increment_and_get_boot_counter();
+  Serial.printf("[INIT] Boot counter / Session ID: %u\r\n", global_session_id);
+  
   Serial.println("[INIT] Initializing modules...");
 
   sensorDataMutex = xSemaphoreCreateMutex();
@@ -264,9 +370,9 @@ void setup() {
   detectOrGenerateNodeId(LORA_SER);
   Serial.printf("[INIT] Final Vehicle ID: %s\r\n", gVehicleConfig.getDeviceId());
   
-  ldr.begin();
-  ldr.setTamperThreshold(600);  
-  Serial.println("[INIT] LDR tamper detection initialized (threshold=600)");
+  tamper.begin();
+  battery.begin();
+  Serial.println("[INIT] Tamper (SW2/Buzzer/LED) and Battery ADC initialized");
 
 
   xTaskCreate(TaskTamperMonitor,    "TamperMon",  2048, NULL, 2, NULL);
@@ -283,5 +389,6 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
