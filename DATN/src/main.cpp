@@ -13,6 +13,7 @@
 #include "vehicle_config.h"
 #include "sensor_Data.h"
 
+<<<<<<< HEAD
 #include "frame_codec.h"
 #include "local_memory.h"
 #include <esp_task_wdt.h>
@@ -21,6 +22,39 @@
 #define WDT_TIMEOUT 10
 
 uint16_t global_session_id = 0;
+=======
+#pragma pack(push, 1)
+struct LoRaFrameHeader {
+    uint8_t magic[2];      // 0x25, 0x03
+    uint8_t device_id;     // 1 - 100
+    uint8_t vehicle_id;    // 1 - 100
+    uint16_t packet_id;    // sequence number (anti-replay)
+    uint32_t timestamp;    // millis or epoch
+    uint8_t type;          // 1 = Telemetry, 2 = Alert/Tamper, 3 = Heartbeat
+    uint8_t flags;         // Bitmask: Bit 0=Tamper, Bit 1=GPS Fix, Bit 2=Vibration, Bit 3=Low Batt
+};
+
+struct LoRaFramePayload {
+    int16_t temperature;    // temp * 10
+    int16_t humidity;       // hum * 10
+    int16_t accel_mag;      // accel * 100
+    uint16_t light_level;   // LDR (0 - 1023)
+    int32_t latitude;       // lat * 1e6
+    int32_t longitude;      // lng * 1e6
+};
+
+struct LoRaFrameFooter {
+    uint16_t auth_tag;      // Authentication tag
+    uint16_t crc;           // CRC16 over Header + Payload + Auth_Tag
+};
+
+struct LoRaFrame {
+    LoRaFrameHeader header;
+    LoRaFramePayload payload; // to be encrypted in-place (16 bytes)
+    LoRaFrameFooter footer;
+};
+#pragma pack(pop)
+>>>>>>> 6bd012583d69115ceb245bcf39663525a76f28ba
 
 // ===== Pins / Config =====
 #define DHTPIN      14
@@ -140,7 +174,10 @@ void TaskTamperMonitor(void *pvParameters) {
 
   esp_task_wdt_add(NULL);
   for (;;) {
+<<<<<<< HEAD
     esp_task_wdt_reset();
+=======
+>>>>>>> 6bd012583d69115ceb245bcf39663525a76f28ba
     // SW2 reads HIGH if box is opened (switch released)
     bool open_state = tamper.isTriggered();
 
@@ -222,7 +259,10 @@ void TaskLoraSend(void *pv) {
     frame.header.magic[1] = 0x03;
     frame.header.device_id = gVehicleConfig.getVehicleNumber();
     frame.header.vehicle_id = gVehicleConfig.getVehicleNumber();
+<<<<<<< HEAD
     frame.header.session_id = global_session_id;
+=======
+>>>>>>> 6bd012583d69115ceb245bcf39663525a76f28ba
     frame.header.packet_id = ++packet_seq;
     frame.header.timestamp = ts;
     frame.header.type = 1; // Telemetry
@@ -231,6 +271,7 @@ void TaskLoraSend(void *pv) {
     frame.header.flags = 0;
     if (is_tamper) {
       frame.header.flags |= (1 << 0);
+<<<<<<< HEAD
     }
     if (lat != 0.0 && lng != 0.0) {
       frame.header.flags |= (1 << 1); // GPS fix flag
@@ -307,7 +348,60 @@ void TaskLoraSend(void *pv) {
 
     if (!ack_received) {
       Serial.println("[ERROR] Failed to send LoRa frame after 3 retries.");
+=======
+>>>>>>> 6bd012583d69115ceb245bcf39663525a76f28ba
     }
+    if (lat != 0.0 && lng != 0.0) {
+      frame.header.flags |= (1 << 1); // GPS fix flag
+    }
+    if (accel_g > 1.2f || accel_g < -1.2f) { // simple vibration threshold
+      frame.header.flags |= (1 << 2);
+    }
+    if (battery_mv < 3400) { // Low battery threshold (3.4V)
+      frame.header.flags |= (1 << 3);
+    }
+
+    // Fill Payload
+    frame.payload.temperature = (int16_t)round(temp * 10.0f);
+    frame.payload.humidity = (int16_t)round(hum * 10.0f);
+    frame.payload.accel_mag = (int16_t)round(accel_g * 100.0f);
+    frame.payload.light_level = battery_mv; // Send battery voltage instead of light level
+    frame.payload.latitude = (int32_t)round(lat * 1e6);
+    frame.payload.longitude = (int32_t)round(lng * 1e6);
+
+    // Encrypt payload in-place (AES-128 16 bytes)
+    encryptBlockInPlace((uint8_t*)&frame.payload);
+
+    // Compute Auth Tag (2 bytes) over Header + encrypted Payload
+    frame.footer.auth_tag = computeFrameAuthTag((const uint8_t*)&frame.header, sizeof(frame.header), (const uint8_t*)&frame.payload, sizeof(frame.payload));
+
+    // Compute CRC (2 bytes) over Header + Payload + Auth Tag (which is 30 bytes)
+    frame.footer.crc = calculateCRC16((const uint8_t*)&frame, sizeof(frame) - sizeof(frame.footer.crc));
+
+    // Convert the 32-byte frame to a 64-character Hex string
+    char hex_payload[65];
+    static const char hexDigits[] = "0123456789abcdef";
+    uint8_t* raw_frame = (uint8_t*)&frame;
+    for (size_t i = 0; i < sizeof(frame); i++) {
+      uint8_t value = raw_frame[i];
+      hex_payload[i * 2]     = hexDigits[(value >> 4) & 0x0F];
+      hex_payload[i * 2 + 1] = hexDigits[value & 0x0F];
+    }
+    hex_payload[64] = '\0';
+
+    // Send the hex-encoded frame via UART to RA-08H
+    LORA_SER.println(hex_payload); 
+    LORA_SER.flush();
+
+    // Print Node debug logs
+    Serial.printf("[SENSOR] Temp=%.1fC, Hum=%.1f%%, Accel=%.2fg, Battery=%umV (%u%%), Tamper=%d\r\n", 
+                  temp, hum, accel_g, battery_mv, battery.getPercent(), is_tamper ? 1 : 0);
+    Serial.printf("[GPS] Lat=%.6f, Lng=%.6f\r\n", lat, lng);
+    Serial.printf("[PACKET] Packing Frame: Seq=%u, DevID=%u, VehID=%u, Type=%u\r\n", 
+                  frame.header.packet_id, frame.header.device_id, frame.header.vehicle_id, frame.header.type);
+    Serial.printf("[AES] Encrypted Payload block: 16 bytes\r\n");
+    Serial.printf("[AUTH] Calculated Auth Tag: 0x%04X, CRC: 0x%04X\r\n", frame.footer.auth_tag, frame.footer.crc);
+    Serial.printf("[ESP32->LORA] Binary frame sent (Hex: %s)\r\n", hex_payload);
 
     vTaskDelayUntil(&xLastWakeTime, xInterval);
   }
